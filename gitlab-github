@@ -1,0 +1,627 @@
+#!/bin/bash
+# GitLab to GitHub Migration Script
+# Handles multiple repositories, creates repos if they don't exist, and updates existing ones
+# Fixes issues with PRs, secrets, and tag migration
+# PRESERVES GitHub-specific branches and content during migration
+
+# Check if required tools are installed
+command -v git >/dev/null 2>&1 || { echo "Error: git is required but not installed. Aborting."; exit 1; }
+command -v curl >/dev/null 2>&1 || { echo "Error: curl is required but not installed. Aborting."; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "Error: jq is required but not installed. Please install with 'apt-get install jq' or equivalent. Aborting."; exit 1; }
+
+# Parameters
+REPOS_FILE=$1
+GITHUB_TOKEN=$2
+GITLAB_TOKEN=$3
+GITHUB_MAPPING_FILE=$4  # Optional: File with mappings of GitLab repo to GitHub repo names
+
+if [ -z "$REPOS_FILE" ] || [ -z "$GITHUB_TOKEN" ] || [ -z "$GITLAB_TOKEN" ]; then
+  echo "Usage: ./migrate_repos.sh <repos_file> <github_token> <gitlab_token> [github_mapping_file]"
+  echo "Example: ./migrate_repos.sh repos.txt github_token gitlab_token mappings.txt"
+  echo ""
+  echo "Format for repos.txt: One GitLab repo URL per line"
+  echo "Format for mappings.txt (optional): gitlab_repo_url,github_repo_name"
+  exit 1
+fi
+
+# Check if the repos file exists
+if [ ! -f "$REPOS_FILE" ]; then
+  echo "Error: Repos file $REPOS_FILE does not exist. Aborting."
+  exit 1
+fi
+
+# Get GitHub username
+GITHUB_USERNAME=$(curl -s -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/user | jq -r '.login')
+
+if [ -z "$GITHUB_USERNAME" ] || [ "$GITHUB_USERNAME" == "null" ]; then
+  echo "Error: Could not get GitHub username. Check your token."
+  exit 1
+fi
+
+echo "GitHub Username: $GITHUB_USERNAME"
+echo "===================================================="
+
+# Create a temp directory for processing
+BASE_TEMP_DIR=$(mktemp -d)
+echo "Created temporary directory: $BASE_TEMP_DIR"
+
+# Function to migrate project variables/secrets
+migrate_project_secrets() {
+  local PROJECT_ID=$1
+  local GITHUB_USERNAME=$2
+  local GITHUB_REPO_NAME=$3
+  
+  echo "Migrating project secrets/variables..."
+  
+  # Get existing GitHub secrets
+  local GITHUB_SECRETS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Accept: application/vnd.github.v3+json" \
+    "https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}/actions/secrets" | jq -r '.secrets[].name')
+  
+  # Get GitLab variables
+  local GITLAB_VARIABLES=$(curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+    "https://gitlab.com/api/v4/projects/${PROJECT_ID}/variables")
+  
+  local VAR_COUNT=$(echo "$GITLAB_VARIABLES" | jq '. | length')
+  
+  if [ "$VAR_COUNT" -gt 0 ]; then
+    echo "$GITLAB_VARIABLES" | jq -c '.[]' | while read -r VAR; do
+      local VAR_KEY=$(echo "$VAR" | jq -r '.key')
+      local VAR_VALUE=$(echo "$VAR" | jq -r '.value')
+      
+      # Check if secret exists in GitHub
+      if echo "$GITHUB_SECRETS" | grep -q "^${VAR_KEY}$"; then
+        echo "  Secret $VAR_KEY already exists in GitHub"
+      else
+        # First, get the repository's public key for encrypting secrets
+        local KEY_RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}/actions/secrets/public-key")
+        
+        local PUBLIC_KEY=$(echo "$KEY_RESPONSE" | jq -r '.key')
+        local KEY_ID=$(echo "$KEY_RESPONSE" | jq -r '.key_id')
+        
+        if [ -z "$PUBLIC_KEY" ] || [ "$PUBLIC_KEY" == "null" ]; then
+          echo "  Error: Could not get public key for repository"
+          continue
+        fi
+        
+        # Create the secret on GitHub
+        local CREATE_RESPONSE=$(curl -s -X PUT -H "Authorization: token $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}/actions/secrets/${VAR_KEY}" \
+          -d "{
+            \"encrypted_value\": \"${VAR_VALUE}\",
+            \"key_id\": \"${KEY_ID}\"
+          }")
+        
+        # Check for errors
+        local ERROR=$(echo "$CREATE_RESPONSE" | jq -r '.message // ""')
+        if [ -n "$ERROR" ] && [ "$ERROR" != "null" ]; then
+          echo "  Error creating secret $VAR_KEY: $ERROR"
+        else
+          echo "  Created secret: $VAR_KEY"
+        fi
+      fi
+    done
+    echo "✓ Migrated project variables to GitHub secrets"
+  else
+    echo "No project variables found to migrate"
+  fi
+}
+
+# Function to migrate PRs from GitLab to GitHub
+migrate_merge_requests() {
+  local PROJECT_ID=$1
+  local PROJECT_PATH_ENCODED=$2
+  local GITHUB_REPO_NAME=$3
+  local REPO_DIR=$4
+  
+  echo "Migrating merge requests..."
+  
+  # Change to repository directory
+  cd "$REPO_DIR"
+  
+  # Fetch all existing PRs from GitHub
+  local GITHUB_PRS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Accept: application/vnd.github.v3+json" \
+    "https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}/pulls?state=all&per_page=100")
+  
+  # Extract PR numbers and titles for comparison
+  local GITHUB_PR_INFO=$(echo "$GITHUB_PRS" | jq -r '.[] | "\(.title) \(.head.ref) \(.base.ref)"')
+  
+  # Fetch all merge requests from GitLab
+  local GITLAB_MRS=$(curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+    "https://gitlab.com/api/v4/projects/${PROJECT_ID}/merge_requests?state=all&per_page=100")
+  
+  # Count merge requests
+  local MR_COUNT=$(echo "$GITLAB_MRS" | jq '. | length')
+  
+  if [ "$MR_COUNT" -eq 0 ]; then
+    echo "No merge requests found in GitLab repository"
+    return 0
+  else
+    echo "Found $MR_COUNT merge requests to process"
+  fi
+  
+  # Get list of branches from GitHub
+  echo "Getting list of GitHub branches..."
+  local GITHUB_BRANCHES=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+    -H "Accept: application/vnd.github.v3+json" \
+    "https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}/branches?per_page=100" | jq -r '.[].name')
+  
+  # Process each merge request
+  echo "$GITLAB_MRS" | jq -c '.[]' | while read -r MR; do
+    # Extract MR details
+    local MR_ID=$(echo "$MR" | jq -r '.iid')
+    local MR_TITLE=$(echo "$MR" | jq -r '.title')
+    local MR_SOURCE_BRANCH=$(echo "$MR" | jq -r '.source_branch')
+    local MR_TARGET_BRANCH=$(echo "$MR" | jq -r '.target_branch')
+    
+    # Create a unique signature for this MR
+    local MR_SIGNATURE="[Migrated] $MR_TITLE $MR_SOURCE_BRANCH $MR_TARGET_BRANCH"
+    
+    # Check if PR already exists with same title and branches
+    if echo "$GITHUB_PR_INFO" | grep -q "$MR_SIGNATURE"; then
+      echo "PR for MR #$MR_ID already exists in GitHub, skipping"
+      continue
+    fi
+    
+    echo "Processing MR #$MR_ID: $MR_TITLE ($MR_SOURCE_BRANCH → $MR_TARGET_BRANCH)"
+    
+    # Additional MR details
+    local MR_DESC=$(echo "$MR" | jq -r '.description // ""' | sed 's/"/\\"/g' | sed 's/\n/\\n/g' | sed 's/\r/\\r/g' | sed 's/\t/\\t/g')
+    local MR_STATE=$(echo "$MR" | jq -r '.state')
+    local MR_AUTHOR=$(echo "$MR" | jq -r '.author.username')
+    local MR_LABELS=$(echo "$MR" | jq -r '.labels | join(", ")')
+    local MR_CREATED_AT=$(echo "$MR" | jq -r '.created_at')
+    
+    # Verify both branches exist on GitHub
+    local SOURCE_EXISTS=false
+    local TARGET_EXISTS=false
+    
+    if echo "$GITHUB_BRANCHES" | grep -q "^${MR_SOURCE_BRANCH}$"; then
+      SOURCE_EXISTS=true
+    fi
+    
+    if echo "$GITHUB_BRANCHES" | grep -q "^${MR_TARGET_BRANCH}$"; then
+      TARGET_EXISTS=true
+    fi
+    
+    # Make sure the GitLab remote is configured
+    if ! git remote | grep -q "^origin$"; then
+      echo "Adding GitLab remote as 'origin'..."
+      git remote add origin "https://oauth2:${GITLAB_TOKEN}@gitlab.com/${PROJECT_PATH_ENCODED}.git"
+    fi
+    
+    # Update origin remote to ensure we have latest refs
+    git fetch origin
+    
+    # If source branch doesn't exist, try to fetch and push it
+    if [ "$SOURCE_EXISTS" = false ]; then
+      echo "Source branch $MR_SOURCE_BRANCH doesn't exist in GitHub. Attempting to create it..."
+      
+      # Specifically fetch this branch from GitLab
+      git fetch origin "$MR_SOURCE_BRANCH:gl_$MR_SOURCE_BRANCH"
+      
+      if [ $? -eq 0 ]; then
+        echo "Successfully fetched source branch from GitLab"
+        git checkout "gl_$MR_SOURCE_BRANCH"
+        
+        # Push to GitHub
+        git push github "gl_$MR_SOURCE_BRANCH:$MR_SOURCE_BRANCH"
+        
+        if [ $? -eq 0 ]; then
+          SOURCE_EXISTS=true
+          echo "Successfully pushed source branch to GitHub"
+        else
+          echo "Failed to push source branch to GitHub"
+        fi
+      else
+        echo "Failed to fetch source branch from GitLab"
+      fi
+    fi
+    
+    # If target branch doesn't exist, try to fetch and push it
+    if [ "$TARGET_EXISTS" = false ]; then
+      echo "Target branch $MR_TARGET_BRANCH doesn't exist in GitHub. Attempting to create it..."
+      
+      # Specifically fetch this branch from GitLab
+      git fetch origin "$MR_TARGET_BRANCH:gl_$MR_TARGET_BRANCH"
+      
+      if [ $? -eq 0 ]; then
+        echo "Successfully fetched target branch from GitLab"
+        git checkout "gl_$MR_TARGET_BRANCH"
+        
+        # Push to GitHub
+        git push github "gl_$MR_TARGET_BRANCH:$MR_TARGET_BRANCH"
+        
+        if [ $? -eq 0 ]; then
+          TARGET_EXISTS=true
+          echo "Successfully pushed target branch to GitHub"
+        else
+          echo "Failed to push target branch to GitHub"
+        fi
+      else
+        echo "Failed to fetch target branch from GitLab"
+      fi
+    fi
+    
+    # Only create PR if both branches exist
+    if [ "$SOURCE_EXISTS" = true ] && [ "$TARGET_EXISTS" = true ]; then
+      # Create a PR on GitHub
+      local PR_DESC="*Migrated from GitLab MR #$MR_ID by $MR_AUTHOR*\n\nOriginally created: $MR_CREATED_AT\n\nLabels: $MR_LABELS\n\n$MR_DESC"
+      
+      echo "Creating GitHub PR for MR #$MR_ID..."
+      local PR_RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+        -H "Accept: application/vnd.github.v3+json" \
+        "https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}/pulls" \
+        -d "{
+          \"title\": \"[Migrated] $MR_TITLE\",
+          \"body\": \"$PR_DESC\",
+          \"head\": \"$MR_SOURCE_BRANCH\",
+          \"base\": \"$MR_TARGET_BRANCH\"
+        }")
+      
+      local PR_NUMBER=$(echo "$PR_RESPONSE" | jq -r '.number')
+      local PR_ERROR=$(echo "$PR_RESPONSE" | jq -r '.message')
+      
+      if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
+        echo "✓ Created GitHub PR #$PR_NUMBER from GitLab MR #$MR_ID"
+        
+        # Add labels if they exist
+        if [ -n "$MR_LABELS" ] && [ "$MR_LABELS" != "null" ] && [ "$MR_LABELS" != "" ]; then
+          # Convert comma-separated labels to JSON array
+          local LABELS_JSON=$(echo "$MR_LABELS" | sed 's/, */","/g' | sed 's/^/["/' | sed 's/$/"]/')
+          
+          curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}/issues/${PR_NUMBER}/labels" \
+            -d "{\"labels\":$LABELS_JSON}"
+        fi
+        
+        # Close PR if original MR was closed/merged
+        if [ "$MR_STATE" != "opened" ]; then
+          curl -s -X PATCH -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}/pulls/${PR_NUMBER}" \
+            -d "{ \"state\": \"closed\" }"
+        fi
+        
+        # Try to get MR comments (discussion notes)
+        local MR_NOTES=$(curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+          "https://gitlab.com/api/v4/projects/${PROJECT_ID}/merge_requests/${MR_ID}/notes?per_page=100")
+        
+        local NOTE_COUNT=$(echo "$MR_NOTES" | jq '. | length' 2>/dev/null || echo 0)
+        
+        if [ "$NOTE_COUNT" -gt 0 ]; then
+          echo "  Migrating $NOTE_COUNT comments from MR #$MR_ID..."
+          
+          echo "$MR_NOTES" | jq -c '.[]' | while read -r NOTE; do
+            # Skip system notes
+            if [ "$(echo "$NOTE" | jq -r '.system')" = "true" ]; then
+              continue
+            fi
+            
+            local NOTE_AUTHOR=$(echo "$NOTE" | jq -r '.author.username')
+            local NOTE_BODY=$(echo "$NOTE" | jq -r '.body' | sed 's/"/\\"/g' | sed 's/\n/\\n/g' | sed 's/\r/\\r/g' | sed 's/\t/\\t/g')
+            local NOTE_CREATED=$(echo "$NOTE" | jq -r '.created_at')
+            
+            # Add comment to GitHub PR
+            local COMMENT_BODY="*Comment by $NOTE_AUTHOR on $NOTE_CREATED (migrated from GitLab):*\n\n$NOTE_BODY"
+            
+            curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}/issues/${PR_NUMBER}/comments" \
+              -d "{ \"body\": \"$COMMENT_BODY\" }"
+          done
+        fi
+      else
+        echo "✗ Failed to create PR for MR #$MR_ID: $PR_ERROR"
+      fi
+    else
+      echo "✗ Cannot create PR: one or both branches are missing on GitHub"
+    fi
+    
+    # Small delay to avoid API rate limits
+    sleep 1
+  done
+  
+  return 0
+}
+
+# Function to migrate a single repository
+migrate_repository() {
+  local GITLAB_URL=$1
+  local CUSTOM_GITHUB_REPO_NAME=$2
+  
+  # Extract repository name and project path from GitLab URL
+  REPO_NAME=$(basename "$GITLAB_URL" .git)
+  PROJECT_PATH=$(echo "$GITLAB_URL" | sed -n 's|https://gitlab\.com/\(.*\)\.git|\1|p')
+  PROJECT_PATH_ENCODED=$(echo "$PROJECT_PATH" | sed 's|/|%2F|g')
+  
+  # Set GitHub repo name (use custom if provided)
+  if [ -n "$CUSTOM_GITHUB_REPO_NAME" ]; then
+    GITHUB_REPO_NAME=$CUSTOM_GITHUB_REPO_NAME
+  else
+    GITHUB_REPO_NAME=$REPO_NAME
+  fi
+  
+  echo "===================================================="
+  echo "Processing repository migration"
+  echo "GitLab Source: $GITLAB_URL"
+  echo "GitHub Target: https://github.com/$GITHUB_USERNAME/$GITHUB_REPO_NAME"
+  
+  # Create a subdirectory for this repo
+  TEMP_DIR="$BASE_TEMP_DIR/$REPO_NAME"
+  mkdir -p "$TEMP_DIR"
+  cd "$TEMP_DIR"
+  
+  # Get GitLab project info
+  echo "Fetching GitLab project information..."
+  PROJECT_INFO=$(curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "https://gitlab.com/api/v4/projects/${PROJECT_PATH_ENCODED}")
+  PROJECT_ID=$(echo "$PROJECT_INFO" | jq -r '.id')
+  
+  if [ -z "$PROJECT_ID" ] || [ "$PROJECT_ID" == "null" ]; then
+    echo "Error: Could not get GitLab project ID for $GITLAB_URL. Skipping..."
+    return 1
+  fi
+  
+  PROJECT_DESC=$(echo "$PROJECT_INFO" | jq -r '.description // ""')
+  PROJECT_VISIBILITY=$(echo "$PROJECT_INFO" | jq -r '.visibility')
+  
+  # Check if GitHub repository exists
+  echo "Checking if GitHub repository exists..."
+  REPO_CHECK=$(curl -s -w "%{http_code}" -o /dev/null -H "Authorization: token $GITHUB_TOKEN" \
+       -H "Accept: application/vnd.github.v3+json" \
+       "https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}")
+  
+  # If GitHub repo doesn't exist, create it
+  if [ "$REPO_CHECK" != "200" ]; then
+    echo "GitHub repository does not exist. Creating repository..."
+    
+    # Map GitLab visibility to GitHub private flag
+    if [ "$PROJECT_VISIBILITY" == "private" ]; then
+      PRIVATE_FLAG="true"
+    else
+      PRIVATE_FLAG="false"
+    fi
+    
+    # Create repository on GitHub
+    CREATE_RESPONSE=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+      -H "Accept: application/vnd.github.v3+json" \
+      -X POST "https://api.github.com/user/repos" \
+      -d "{
+        \"name\": \"$GITHUB_REPO_NAME\",
+        \"description\": \"$PROJECT_DESC\",
+        \"private\": $PRIVATE_FLAG
+      }")
+    
+    CREATE_ERROR=$(echo "$CREATE_RESPONSE" | jq -r '.message // ""')
+    
+    if [ -n "$CREATE_ERROR" ] && [ "$CREATE_ERROR" != "null" ] && [ "$CREATE_ERROR" != "" ]; then
+      echo "Error creating repository: $CREATE_ERROR"
+      return 1
+    else
+      echo "✓ Created GitHub repository: $GITHUB_USERNAME/$GITHUB_REPO_NAME"
+    fi
+    
+    # Clone GitLab repository with authentication
+    echo "Cloning GitLab repository..."
+    git clone --mirror "https://oauth2:${GITLAB_TOKEN}@gitlab.com/${PROJECT_PATH}.git" $REPO_NAME
+    
+    if [ $? -ne 0 ]; then
+      echo "Error: Failed to clone repository $GITLAB_URL. Skipping..."
+      return 1
+    fi
+    
+    # Push everything to GitHub
+    cd $REPO_NAME
+    echo "Pushing all branches, tags, and history to GitHub..."
+    git push --mirror "https://oauth2:${GITHUB_TOKEN}@github.com/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}.git"
+    
+    if [ $? -ne 0 ]; then
+      echo "Error: Failed to push to GitHub repository. Skipping..."
+      return 1
+    fi
+    
+    echo "✓ Successfully pushed all code, branches, tags, and history to GitHub"
+    
+    # Clone regular repository for PR migration
+    cd ..
+    git clone "https://oauth2:${GITLAB_TOKEN}@gitlab.com/${PROJECT_PATH}.git" repo
+    cd repo
+    
+    # Add GitHub remote
+    git remote add github "https://oauth2:${GITHUB_TOKEN}@github.com/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}.git"
+    
+    # Get labels from GitLab and migrate them to GitHub
+    echo "Migrating labels from GitLab to GitHub..."
+    GITLAB_LABELS=$(curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+      "https://gitlab.com/api/v4/projects/${PROJECT_ID}/labels?per_page=100")
+    
+    echo "$GITLAB_LABELS" | jq -c '.[]' | while read -r LABEL; do
+      LABEL_NAME=$(echo "$LABEL" | jq -r '.name')
+      LABEL_COLOR=$(echo "$LABEL" | jq -r '.color' | sed 's/^#//')
+      LABEL_DESC=$(echo "$LABEL" | jq -r '.description // ""')
+      
+      # Create the label on GitHub
+      curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
+        -H "Accept: application/vnd.github.v3+json" \
+        "https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}/labels" \
+        -d "{
+          \"name\": \"$LABEL_NAME\",
+          \"color\": \"$LABEL_COLOR\",
+          \"description\": \"$LABEL_DESC\"
+        }" > /dev/null
+    done
+    
+    echo "✓ Migrated labels from GitLab to GitHub"
+    
+    # Migrate project variables/secrets
+    migrate_project_secrets "$PROJECT_ID" "$GITHUB_USERNAME" "$GITHUB_REPO_NAME"
+    
+    # Migrate merge requests
+    migrate_merge_requests "$PROJECT_ID" "$PROJECT_PATH_ENCODED" "$GITHUB_REPO_NAME" "$TEMP_DIR/repo"
+    
+  else
+    echo "GitHub repository $GITHUB_USERNAME/$GITHUB_REPO_NAME already exists"
+    
+    # Create mirror clone for syncing
+    echo "Creating a mirror clone of GitLab repository..."
+    git clone --mirror "https://oauth2:${GITLAB_TOKEN}@gitlab.com/${PROJECT_PATH}.git" mirror
+    
+    if [ $? -ne 0 ]; then
+      echo "Error: Failed to create mirror clone. Skipping repository update."
+      return 1
+    fi
+    
+    cd mirror
+    
+    # Ensure tags are fetched
+    echo "Fetching all tags from GitLab..."
+    git fetch --tags
+    
+    # Add GitHub remote to the mirror
+    git remote add github "https://oauth2:${GITHUB_TOKEN}@github.com/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}.git"
+    
+    # Fetch from GitHub to get current state
+    echo "Fetching current state from GitHub..."
+    git fetch github
+    
+    # IMPORTANT CHANGE: Instead of "--mirror" we use "--all" and "--tags" to preserve GitHub-specific branches
+    echo "Pushing all branches from GitLab to GitHub without removing GitHub-specific branches..."
+    git push github --all --force
+    git push github --tags
+    
+    if [ $? -ne 0 ]; then
+      echo "Error: Failed to push to GitHub repository. Trying alternative approach..."
+      # Try pushing branches one by one
+      echo "Trying to push branches one by one..."
+      git branch -r | grep "origin/" | sed 's/origin\///' | while read branch; do
+        if [ "$branch" != "HEAD" ]; then
+          git push github "refs/remotes/origin/$branch:refs/heads/$branch" || echo "Failed to push branch $branch"
+        fi
+      done
+      git push github --tags
+    fi
+    
+    echo "✓ Updated repository with all branches and tags (preserving GitHub-specific branches)"
+    
+    # Clone regular repository for PR migration and other operations
+    cd "$TEMP_DIR"
+    git clone "https://oauth2:${GITLAB_TOKEN}@gitlab.com/${PROJECT_PATH}.git" repo
+    cd repo
+    
+    # Add GitHub remote
+    git remote add github "https://oauth2:${GITHUB_TOKEN}@github.com/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}.git"
+    
+    # Update labels
+    echo "Updating labels..."
+    GITLAB_LABELS=$(curl -s -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+      "https://gitlab.com/api/v4/projects/${PROJECT_ID}/labels?per_page=100")
+    
+    GITHUB_LABELS=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+      -H "Accept: application/vnd.github.v3+json" \
+      "https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}/labels?per_page=100")
+    
+    GITHUB_LABEL_NAMES=$(echo "$GITHUB_LABELS" | jq -r '.[].name')
+    
+    echo "$GITLAB_LABELS" | jq -c '.[]' | while read -r LABEL; do
+      LABEL_NAME=$(echo "$LABEL" | jq -r '.name')
+      
+      # Check if label exists in GitHub
+      if ! echo "$GITHUB_LABEL_NAMES" | grep -q "^${LABEL_NAME}$"; then
+        LABEL_COLOR=$(echo "$LABEL" | jq -r '.color' | sed 's/^#//')
+        LABEL_DESC=$(echo "$LABEL" | jq -r '.description // ""')
+        
+        # Create the label on GitHub
+        curl -s -X POST -H "Authorization: token $GITHUB_TOKEN" \
+          -H "Accept: application/vnd.github.v3+json" \
+          "https://api.github.com/repos/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}/labels" \
+          -d "{
+            \"name\": \"$LABEL_NAME\",
+            \"color\": \"$LABEL_COLOR\",
+            \"description\": \"$LABEL_DESC\"
+          }" > /dev/null
+        
+        echo "  Created new label: $LABEL_NAME"
+      fi
+    done
+    
+    # Migrate project variables/secrets
+    migrate_project_secrets "$PROJECT_ID" "$GITHUB_USERNAME" "$GITHUB_REPO_NAME"
+    
+    # Migrate merge requests
+    migrate_merge_requests "$PROJECT_ID" "$PROJECT_PATH_ENCODED" "$GITHUB_REPO_NAME" "$TEMP_DIR/repo"
+  fi
+  
+  # Extra check for tags
+  echo "Verifying all tags were migrated..."
+  cd "$TEMP_DIR"
+  
+  # Get tags from GitLab
+  mkdir -p gitlab_tags
+  cd gitlab_tags
+  git init
+  git remote add origin "https://oauth2:${GITLAB_TOKEN}@gitlab.com/${PROJECT_PATH}.git"
+  git fetch --tags origin
+  GITLAB_TAGS=$(git tag)
+  cd ..
+  
+  # Get tags from GitHub
+  mkdir -p github_tags
+  cd github_tags
+  git init
+  git remote add origin "https://oauth2:${GITHUB_TOKEN}@github.com/${GITHUB_USERNAME}/${GITHUB_REPO_NAME}.git"
+  git fetch --tags origin
+  GITHUB_TAGS=$(git tag)
+  cd ..
+  
+  # Compare tags and push missing ones
+  for TAG in $GITLAB_TAGS; do
+    if ! echo "$GITHUB_TAGS" | grep -q "^${TAG}$"; then
+      echo "Tag $TAG missing from GitHub, pushing it..."
+      cd repo
+      git fetch origin "refs/tags/$TAG:refs/tags/$TAG"
+      git push github "refs/tags/$TAG"
+      cd ..
+    fi
+  done
+  
+  echo "Completed migration for $GITLAB_URL"
+  return 0
+}
+
+# Process each repository from the repos file
+while IFS= read -r line || [ -n "$line" ]; do
+  # Skip empty lines and comments
+  if [ -z "$line" ] || [[ "$line" == \#* ]]; then
+    continue
+  fi
+  
+  GITLAB_URL=$line
+  CUSTOM_GITHUB_NAME=""
+  
+  # If mappings file is provided, check for a custom GitHub name
+  if [ -n "$GITHUB_MAPPING_FILE" ] && [ -f "$GITHUB_MAPPING_FILE" ]; then
+    MAPPING=$(grep "^$GITLAB_URL," "$GITHUB_MAPPING_FILE" || echo "")
+    if [ -n "$MAPPING" ]; then
+      CUSTOM_GITHUB_NAME=$(echo "$MAPPING" | cut -d',' -f2)
+    fi
+  fi
+  
+  migrate_repository "$GITLAB_URL" "$CUSTOM_GITHUB_NAME"
+  
+  echo "----------------------------------------------------"
+  echo ""
+done < "$REPOS_FILE"
+
+# Clean up
+echo "Cleaning up temporary directory..."
+rm -rf "$BASE_TEMP_DIR"
+
+echo "===================================================="
+echo "Migration process completed!"
+echo "All repositories have been processed."
+echo "Please check the output above for any errors or warnings."
