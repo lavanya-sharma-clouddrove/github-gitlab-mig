@@ -1,0 +1,63 @@
+# .github/workflows/demo-workflow.yml
+
+name: Demo Workflow with 4 Jobs
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  job1-setup:
+    name: Setup Environment
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+  job2-tests:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run dummy tests
+        run: |
+          echo "Running tests..."
+          sleep 5
+          echo "Tests passed!"
+
+  job3-lint:
+    name: Lint Code
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run linter
+        run: |
+          echo "Linting code..."
+          sleep 2
+          echo "Lint passed!"
+
+  job4-build:
+    name: Build Project
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Project
+        run: |
+          echo "Building project..."
+          sleep 3
+          echo "Build successful!"
