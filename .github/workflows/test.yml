@@ -3,6 +3,7 @@
 name: Demo Workflow with 4 Jobs
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -24,6 +25,7 @@ jobs:
           node-version: '18'
 
   job2-tests:
+    needs: job1-setup
     name: Run Tests
     runs-on: ubuntu-latest
     steps:
@@ -37,6 +39,7 @@ jobs:
           echo "Tests passed!"
 
   job3-lint:
+    needs: job2-tests
     name: Lint Code
     runs-on: ubuntu-latest
     steps:
@@ -50,6 +53,7 @@ jobs:
           echo "Lint passed!"
 
   job4-build:
+    needs: job3-lint
     name: Build Project
     runs-on: ubuntu-latest
     steps:
