@@ -1,15 +1,13 @@
-# .github/workflows/demo-workflow.yml
-
-name: Demo Workflow with 4 Jobs
+name: Demo Workflow with Manual Approval
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
   pull_request:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
   job1-setup:
@@ -25,9 +23,9 @@ jobs:
           node-version: '18'
 
   job2-tests:
-    needs: job1-setup
     name: Run Tests
     runs-on: ubuntu-latest
+    needs: job1-setup
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -39,9 +37,9 @@ jobs:
           echo "Tests passed!"
 
   job3-lint:
-    needs: job2-tests
     name: Lint Code
     runs-on: ubuntu-latest
+    needs: job2-tests
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -53,15 +51,20 @@ jobs:
           echo "Lint passed!"
 
   job4-build:
-    needs: job3-lint
-    name: Build Project
+    name: Deploy Project (Manual Approval)
     runs-on: ubuntu-latest
+    needs: job3-lint
+    environment:
+      name: production
+      reviewers:
+        - lavanya-sharma-clouddrove
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build Project
+      - name: Deploy
         run: |
-          echo "Building project..."
+          echo "Waiting for manual approval..."
+          echo "Deploying project..."
           sleep 3
-          echo "Build successful!"
+          echo "Deployment complete!"
