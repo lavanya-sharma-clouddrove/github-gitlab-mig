@@ -56,8 +56,8 @@ jobs:
     needs: job3-lint
     environment:
       name: production
-      reviewers:
-        - lavanya-sharma-clouddrove
+      # reviewers:
+      #   - lavanya-sharma-clouddrove
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
